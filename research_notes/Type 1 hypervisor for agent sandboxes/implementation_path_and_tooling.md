@@ -332,3 +332,181 @@ As of 2026 a custom hypervisor can in principle be developed and CI-tested on or
 - GCP AMD (N4D) nested support is unconfirmed.
 - No official statement from any cloud on running a non-KVM, non-Hyper-V L1 hypervisor.
 - ARM64 nested virtualization availability on any cloud and in upstream KVM was not verified.
+
+---
+
+> Scope update (2026-11-26): ARM64 is a **confirmed** target, not optional. Sections 11–15 cover the AArch64 path at the same depth as x86-64. Where sections 1–10 call ARM64 an add-on or say "add an ARM server only once x86 is stable", sections 11–15 supersede them.
+
+## 11. AArch64 language, toolchain and crates
+
+### Takeaway
+The Rust bare-metal AArch64 stack is in better shape than the x86 one for hypervisor work because Google maintains a set of `no_std` crates for exactly this (pKVM/Android firmware): `smccc` (SMCCC + PSCI), `arm-gic`, `aarch64-paging`, `aarch64-rt`, plus the community `aarch64-cpu` register crate and `fdt` parsers. The one real codegen trap is floating point/SIMD: use a soft-float or FP-disabled build for EL2 code.
+
+### Cited Findings
+- `smccc` (Google) is `no_std`, covers Arm SMC Calling Convention 1.4 and PSCI 1.1 on aarch64, and can issue calls by either HVC or SMC (0.2.x); newer versions also cover aarch32. — [smccc on docs.rs](https://docs.rs/crate/smccc/0.2.1); [google/psci repo](https://github.com/google/psci) (snippets)
+- Google's `osdemo` example combines `arm-gic` (Generic Interrupt Controller driver), `smccc`, `aarch64-paging` and `aarch64-rt` as a reference for bare-metal aarch64 OS development in Rust. — [osdemo on lib.rs](https://lib.rs/crates/osdemo) (snippet)
+- `aarch64-cpu` (v11.x) is a `no_std` crate for system-register access, originating in the rust-raspberrypi-OS-tutorials project. — [aarch64-cpu docs.rs](https://docs.rs/aarch64-cpu/11.1.0/src/aarch64_cpu/lib.rs.html) (snippet)
+- Real-project evidence: a 30K-line `no_std` Rust EL2 hypervisor/SPMC names `fdt` as its only external crate and uses `alloc` with a bump allocator. Its worst bug was a debug build turning `read_volatile` into NEON instructions that EL3 firmware trapped (silent hang, hours in GDB); advice is `opt-level = 1` from the start. — [users.rust-lang.org post](https://users.rust-lang.org/t/30k-lines-of-no-std-rust-a-bare-metal-arm64-hypervisor-that-replaces-googles-hafnium-spmc/139497)
+- `limine` crate 0.6.3 has an aarch64 MP module whose `MpInfo` exposes processor ID and MPIDR, so Limine can be the UEFI loader and can start secondary CPUs on Arm too. `uefi-rs` supports aarch64. — [limine 0.6.3 aarch64 MP source](https://docs.rs/crate/limine/0.6.3/source/src/mp/aarch64.rs); [uefi-rs](https://github.com/ben-krieger/uefi-rs) (snippets)
+- `virtio-drivers` (no_std, used in Android's pKVM `vmbase`/Trusty) gives guest-side virtio block/net/console for when the hypervisor itself runs on QEMU `virt`. — [virtio-drivers docs.rs](https://docs.rs/crate/virtio-drivers/0.7.5); [Android vmbase README](https://android.googlesource.com/platform/packages/modules/Virtualization/+/2e2f48a9/vmbase/README.md) (snippets)
+
+### Inferences
+- Targets (background knowledge, not verified this session): `aarch64-unknown-none` (hard-float ABI, uses FP/SIMD registers) and `aarch64-unknown-none-softfloat` (no FP/SIMD use). Build the EL2 core with the soft-float target so the hypervisor never touches guest FP/SVE/SME state and can lazily switch it; this also avoids the NEON trap above. Both are prebuilt rustup targets, so stable Rust works without `build-std`.
+- Crates the hypervisor still has to write or heavily extend: `aarch64-cpu` covers common EL1/EL2 registers, but expect gaps for GICv3 hypervisor interface (`ICH_*`), newer features (FGT, NV, SVE/SME traps, PAuth keys), stage-2 specific formats; `arm-gic` is a *physical* GIC driver, not a vGIC; no reusable SMMUv3 driver or ACPI IORT parser for hypervisor use that I know of (the `acpi` crate's coverage of MADT GICC/GICD/GICR/ITS and IORT entries needs checking).
+- Device tree and ACPI are both required (see section 12), so budget for `fdt` (parse host DT on boards) plus an FDT *writer* for guest DTs (`vm-fdt` from rust-vmm does this; `no_std` status unverified).
+
+### Gaps
+- `arm-gic`, `aarch64-paging`, `aarch64-rt`, `vm-fdt`, `acpi` crate: versions, `no_std` status, GICv3 hypervisor-interface and IORT coverage not verified.
+- Tier status of `aarch64-unknown-none*` not checked this session.
+
+---
+
+## 12. AArch64 bare-metal bring-up and ordered milestones (EL2, stage-2, vGIC, Linux at EL1)
+
+### Takeaway
+Reaching a Linux guest is quicker on Arm than on x86: firmware hands over at EL2 in a defined state, PSCI starts secondary CPUs, there is no VMCS-style consistency checking, and GICv3 has built-in virtual CPU interface support. The cost moves to platform variance: servers boot with UEFI+ACPI (MADT GIC structures, GTDT, IORT, MCFG), boards boot with devicetree, and IOMMU/MSI plumbing (SMMUv3 + ITS) is harder than VT-d.
+
+### Cited Findings
+- Entry state: Linux's arm64 boot protocol states the CPU "must be in non-secure state, either in EL2 (RECOMMENDED in order to have access to the virtualisation extensions), or in EL1"; a hypervisor loaded the same way by UEFI/U-Boot gets the same handover. With GICv3, system-register access must be enabled by higher levels; with GICv2-compat mode `ICC_SRE_EL2.SRE` must be 0 and DT/ACPI must describe a GICv2. — [Booting AArch64 Linux](https://www.kernel.org/doc/html/v7.1/arch/arm64/booting.html) (snippet)
+- Server platform contract: Arm SystemReady (SR band) certifies BSA + SBSA hardware and SBBR firmware (UEFI, ACPI, SMBIOS), and the requirements cover SMCCC and PSCI calls and secondary-core boot. SBSA v7.2 is dated Nov 2024, BBR v2.2 June 2025. The IR band (embedded) is BSA + EBBR with devicetree. — [Arm SystemReady](https://arm.com/systemready); [UEFI Forum SystemReady slides](https://uefi.org/sites/default/files/resources/15.%20Integrate%20Arm%20SystemReady_Arm_Wang_FINAL.pdf) (snippets; clause-level GICv3/SMMUv3 requirements not confirmed from an official page)
+- PSCI 1.1 via SMC/HVC is available from the `smccc` crate (CPU_ON, CPU_OFF, SYSTEM_RESET etc.). — [smccc docs.rs](https://docs.rs/crate/smccc/0.2.1) (snippet)
+- QEMU `virt` gives a full emulated target: `virtualization=on` exposes EL2 (default off); `gic-version=3|4|max` (under TCG `max` is 4 when virtualization is on); `iommu=smmuv3` creates a machine-wide SMMUv3 for the PCIe topology. An older doc revision notes ITS is not modeled under TCG; check the release in use. — [QEMU virt docs](https://www.qemu.org/docs/master/system/arm/virt) (snippet)
+- Scope-cutting precedent: KVM/arm64 restricted nested support to FEAT_NV2 only, dropping plain FEAT_NV, because all hardware with NV has NV2. A new hypervisor can similarly require a recent architecture baseline. — [linux-arm-kernel, Nov 2023](https://lists.infradead.org/pipermail/linux-arm-kernel/2023-November/882044.html) (snippet)
+- AxVisor runs Linux guests on four real ARM64 boards (RK3588, RK3568, Phytium) from a Rust type-1 code base, i.e. the Arm path is the more hardware-proven one in the Rust hypervisor ecosystem. — [AxVisor repo](https://github.com/arceos-hypervisor/axvisor)
+
+### Inferences
+Ordered milestones (background engineering knowledge, not verified against sources this session; effort for 2–3 experienced engineers is my estimate).
+
+1. **A0 – Boot at EL2 and print (about 1 week).** Entry as a UEFI application (PE/COFF with the arm64 Image header, or via Limine) on servers; flat image + DTB pointer in x0 on boards/QEMU `-kernel`. Verify `CurrentEL == EL2`; set `VBAR_EL2`, stack, BSS; PL011 or 16550 UART (address from ACPI SPCR/DBG2 or DT `/chosen/stdout-path`).
+   - Pitfalls: firmware entering at EL1 (cloud VMs, some boards; nothing can be done); FP/SIMD traps (`CPTR_EL2`) and Rust emitting NEON; alignment faults from `SCTLR_EL2.A`; relocating a position-independent image; UEFI leaving the MMU and caches on with its own tables.
+2. **A1 – EL2 MMU and memory (1–2 weeks).** Decide **nVHE vs VHE** now: with `HCR_EL2.E2H=1` (VHE, Armv8.1+) EL2 gets two translation regimes and EL1-like registers, which suits a hypervisor with EL0 user-mode VMMs; nVHE is simpler for a pure EL2 kernel. Stage-1 tables for EL2, `MAIR/TCR/SCTLR_EL2`, memory map from UEFI or DT `/memory` + reserved-memory.
+   - Pitfalls: break-before-make rules when changing live mappings; cache maintenance before enabling the MMU; 4K vs 16K/64K granule support (`ID_AA64MMFR0_EL1`); physical address size up to 52 bits (LPA/LPA2).
+3. **A2 – Platform discovery (2–3 weeks).** Two front ends feeding one internal model: ACPI (MADT GICC/GICD/GICR/ITS entries, GTDT for timer PPIs, MCFG for ECAM, IORT for SMMU/ITS ID mappings, PPTT for topology, SPCR) and FDT. No AML needed if PCI uses MSI only.
+   - Pitfalls: IORT ID-mapping chains (RID → StreamID → DeviceID); firmware that only gets one of ACPI/DT right; reserved regions (RMR nodes in IORT).
+4. **A3 – GICv3 host + timers + SMP (2–3 weeks).** Distributor and per-CPU redistributor init, `ICC_SRE_EL2`, priority mask, EL2 physical timer (`CNTHP_*`) for the scheduler tick; secondaries via PSCI `CPU_ON` with an EL2 entry stub; SGIs for IPIs; per-CPU data in `TPIDR_EL2`.
+   - Pitfalls: redistributor wake sequence (`GICR_WAKER`); MPIDR affinity vs linear CPU index; PSCI conduit (SMC on servers, sometimes HVC); errata-dependent CPU features on big.LITTLE boards (RK3588: A76+A55 differ in features, so vCPU feature set must be the intersection or vCPUs must be pinned per cluster).
+5. **A4 – First guest code at EL1 (1–2 weeks).** `HCR_EL2` (VM, IMO/FMO/AMO, TSC, TWI/TWE, RW, and friends), `VTCR_EL2`/`VTTBR_EL2` with VMID, stage-2 tables, `SPSR_EL2`/`ELR_EL2` then `ERET`; world switch saving EL1 system registers, GPRs and (lazily) FP/SVE; exception vector for lower-EL sync/IRQ; decode `ESR_EL2` (HVC, SMC, data/instruction abort, sysreg trap, WFx).
+   - Pitfalls: far fewer than x86 at this step. Common ones: wrong `VTCR_EL2` T0SZ/SL0 vs table levels, forgetting `ISB`, stage-2 permission/access-flag faults, VMID rollover and TLB invalidation, not context-switching `CNTVOFF_EL2`/`CNTKCTL_EL1`, PAuth keys and SVE vector length per vCPU.
+6. **A5 – Linux to an initramfs shell, 1 vCPU (3–5 weeks).** Load `Image` at a 2 MiB-aligned address with a generated guest DTB (memory, `psci` node with `method = "hvc"`, GICv3 node, `arm,armv8-timer`, UART, `chosen`); emulate PSCI for the guest (at least `PSCI_VERSION`, `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF/RESET`, `FEATURES`) and SMCCC arch calls (version, `ARCH_FEATURES`, Spectre workaround discovery); ID-register sanitisation (trap with `HCR_EL2.TID3` and present a filtered view: hide SVE/SME/MTE/PMU/SPE/AMU/RAS features not context-switched); virtual timer passthrough (`CNTV_*` with `CNTVOFF_EL2`), trapping or emulating the EL1 physical timer; emulated PL011 by stage-2 data-abort MMIO using `ESR_EL2.ISV` syndrome (no instruction decoder needed for normal accesses).
+   - Pitfalls: aborts without valid syndrome (`ISV=0`, e.g. load-pair to MMIO) need a decoder or must be rejected; guest cache-maintenance and `HCR_EL2.TVM`-style handling while the guest MMU is off; DTB placement and size limits; speculative-execution mitigations exposed through SMCCC.
+7. **A6 – Virtual GIC (4–6 weeks, long tail).** GICv3 only: guest CPU interface is handled in hardware through `ICH_LR<n>_EL2` list registers once `ICH_HCR_EL2.En` is set; the hypervisor emulates the distributor and redistributor MMIO frames, maintains pending/active state, fills list registers on entry, handles maintenance interrupts, and links physical to virtual IRQs for passed-through devices (HW bit) and for the virtual timer PPI.
+   - Pitfalls: list-register overflow and priority ordering; level-triggered resampling; SGI delivery between vCPUs (trap `ICC_SGI1R_EL1`); migrating a vCPU with active interrupts; EOI mode with deactivation split. This is the Arm equivalent of the x86 interrupt-injection long tail, and it is where most Arm hypervisor bugs live.
+8. **A7 – SMP guests (2–3 weeks).** PSCI `CPU_ON` creates/starts vCPUs; WFI trapping and blocking; vSGIs; per-vCPU `VMPIDR_EL2`; PV time (stolen-time SMCCC interface) for fair scheduling.
+9. **A8 – virtio (shared with x86).** virtio-mmio described in the guest DT is the least-effort transport; virtio-pci needs an emulated ECAM host bridge and a vITS or GICv2m-style MSI frame. Backends live wherever the x86 design puts them.
+10. **A9 – SMMUv3, ITS and passthrough (8–14 weeks).** SMMUv3 stage-2 with stream table, command/event queues, per-device STEs sharing the VM's stage-2 tables or separate ones; default-deny for all StreamIDs; physical ITS driver (device/collection/ITT tables, LPI configuration and pending tables) because PCIe MSIs on servers arrive as LPIs; a virtual ITS, or GICv4/4.1 direct vLPI injection, for passed-through devices.
+    - Pitfalls: ITS is a substantial driver with command queues and memory tables shared with hardware; SMMU vendor quirks and firmware RMRs; devices sharing StreamIDs; no interrupt-remapping equivalent to lean on beyond the ITS itself; GICv4 doorbell and vPE scheduling complexity (skip GICv4 for v1).
+11. **A10 – Server hardening.** RAS (SError routing, firmware-first error handling via SDEI/APEI GHES), CPU errata workarounds table (Linux's `cpu_errata.c` is the reference list), SVE/SME state management and vector-length policy, PAuth/BTI/MTE exposure policy, PMU virtualisation, CPU hotplug and idle states through PSCI `CPU_SUSPEND`, kexec/live update.
+
+Comparison with the x86 list in section 3: A0–A5 total roughly 9–16 weeks versus M0–M5 at roughly 13–24 weeks; the vGIC (A6) is comparable to M6; SMMUv3+ITS (A9) is larger than VT-d (M9).
+
+### Gaps
+- Official SBSA clause text for mandatory GICv3/SMMUv3 levels not retrieved.
+- No sourced evidence on how well SystemReady-certified servers (Ampere Altra/AmpereOne, Graviton metal, Cobalt) behave for a non-Linux EL2 payload; firmware quality claims are untested.
+- No sourced timings for Arm bring-up by comparable teams.
+
+---
+
+## 13. Reusable Arm hypervisor code and designs
+
+### Takeaway
+There is more open, small, readable Arm hypervisor code than x86 code, but almost all of it targets embedded boards with devicetree and static partitioning; none is a ready base for dynamic, high-density sandboxes on ACPI servers. Use these as references (and Xen-on-Arm or KVM as fallbacks), and expect to write the vGIC, SMMUv3/ITS and ACPI front end yourself.
+
+### Cited Findings
+- pKVM: upstream arm64 only; protected guests landed in Linux 7.1 as "very experimental"; kernel docs call it "an experimental, development feature and subject to breaking changes"; an October 2026 pull describes basic "pKVM state isolation". Protected-guest upstreaming was described by Will Deacon in January 2026 as "somewhat languishing". GPLv2 as part of Linux. — [Phoronix on Linux 7.1](https://phoronix.com/news/linux-7.1-kvm); [kernel docs pKVM](https://docs.kernel.org/next/virt/kvm/arm/pkvm.html); [linux-arm-kernel Jan 2026](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-January/1091563.html) (snippets)
+- Hafnium: now the reference S-EL2 Secure Partition Manager Core in the TF-A stack (FF-A), AArch64 only, with Arm FVP as the only platform supported in the TF-A reference stack. It has moved away from being a general normal-world hypervisor. — [Hafnium SPM docs](https://git.trustedfirmware.org/plugins/gitiles/hafnium/hafnium.git/+/49b95f03f91885ce871d5313f941f8d274c9b935/docs/secure-partition-manager/secure-partition-manager.rst); [TF-A SPM docs](https://trustedfirmware-a.readthedocs.io/en/v2.4/components/secure-partition-manager.html) (snippets)
+- Bao: clean-slate static partitioning hypervisor for Armv8-A and RISC-V, under 20K SLOC (second-hand); listed boards are embedded (Xilinx ZCU102/ZCU104, Ultra96, HiKey 960, i.MX8, QEMU virt); boots standalone without a Linux root cell. — [Bao paper, OASIcs NG-RES 2020](https://drops.dagstuhl.de/entities/document/10.4230/OASIcs.NG-RES.2020.3); [Bao README (fork)](https://github.com/ninolomata/bao-hypervisor/blob/main/README.md); [arXiv 2106.04514](https://arxiv.org/pdf/2106.04514.pdf) (snippets; platform list may be dated)
+- A comparative study covers Jailhouse, Xen dom0less, Bao and the seL4 CAmkES VMM on Arm for code size, performance, interrupt latency, inter-VM communication and boot time. — [Martins & Pinto, arXiv 2303.11186](https://arxiv.org/abs/2303.11186v2) (snippet; figures not retrieved)
+- seL4 + Microkit + libvmm: AArch64 is the mature path (libvmm 0.2.0, Aug 2026, "runs on AArch64 and x86-64"; x86 still needs a development SDK). — [Trustworthy Systems](https://www.trustworthy.systems/projects/virtualisation/); [au-ts/libvmm](https://github.com/au-ts/libvmm) (snippets)
+- Xen on Arm: dom0less (multiple domains built at boot from devicetree, no dom0 required: "true static partitioning") is an established Arm feature; Xen 4.21 added virtio-pci and parallel boot work for dom0less systems. — [Xen blog: true static partitioning with dom0less](https://xenproject.org/blog/true-static-partitioning-with-xen-dom0-less/); [Xen 4.21 release](https://www.linuxfoundation.org/press/xen-project-delivers-xen-4.21-a-modernized-hypervisor-with-broader-architecture-support-and-improved-performance) (snippets)
+- Rust-Shyper: Rust AArch64 embedded type-1 with VM migration and hypervisor live-update (JSA 2023 paper); an openEuler project. — [openEuler write-up](https://www.openeuler.org/en/blog/20230428-rust/20230428-rust); [Gitee repo](https://gitee.com/openeuler/rust_shyper) (snippets) **[dated]**
+- AxVisor: Apache-2.0 Rust type-1, one code base for x86_64/aarch64/RISC-V, Linux guests on RK3588/RK3568/Phytium boards and QEMU; 118 commits, no releases. — [AxVisor repo](https://github.com/arceos-hypervisor/axvisor)
+- Other small Rust AArch64 type-1 projects exist as learning references (e.g. a 30K-line SPMC/hypervisor validated against TF-A + pKVM). — [project page](https://willamhou.github.io/hypervisor/); [users.rust-lang.org post](https://users.rust-lang.org/t/30k-lines-of-no-std-rust-a-bare-metal-arm64-hypervisor-that-replaces-googles-hafnium-spmc/139497)
+- Edera/krata's Xen-based stack lists aarch64 at 10–30% complete, so the "Xen core + Rust toolstack" route is not yet proven on Arm by its main proponent. — [krata repo](https://www.github.com/edera-dev/krata) (snippet)
+
+### Inferences
+- Best reading order for an implementer: Bao (smallest complete Armv8 + GICv3 static hypervisor in C) → KVM/arm64 `arch/arm64/kvm/hyp/nvhe` and `vgic/` (the production reference for world switch, vGIC-v3, ID-register sanitisation, errata; GPLv2, so study but do not copy into a permissively licensed code base) → Xen `xen/arch/arm` for ACPI + SMMUv3 + ITS on servers → AxVisor/Rust-Shyper for Rust structuring.
+- On Arm, "option 5" (pKVM-style) is the one place where a deprivileged-Linux design actually exists upstream. If the Arm product could ship on pKVM while x86 uses something else, the two architectures would diverge in architecture and TCB story; that undercuts the single-codebase goal and pKVM's experimental status makes it a poor foundation in 2026.
+- Xen on Arm is a credible fallback for Arm servers (ACPI, SMMUv3, ITS, dom0less all exist), stronger relative to the alternatives than Xen is on x86.
+- Licences from background knowledge (verify): Bao Apache-2.0; Hafnium BSD-3-Clause; Rust-Shyper MulanPSL-2.0; Xen and pKVM GPLv2; seL4 kernel GPLv2.
+
+### Gaps
+- Bao's GICv3/SMMU support level, current platform list and licence not confirmed from the official repo.
+- No LOC or team-size data for Rust-Shyper, Hafnium, Xen/Arm.
+- Whether any of these has been run on Ampere/Graviton-class ACPI servers (other than Xen and KVM) is unknown.
+
+---
+
+## 14. AArch64 development workflow: emulation, nested virtualization, hardware
+
+### Takeaway
+QEMU `virt` with `virtualization=on` under TCG is the universal dev and CI target and needs no special host, but it is slow and emulation-accurate rather than hardware-accurate. Hardware-accelerated nested development needs FEAT_NV2 silicon on bare metal (AmpereOne-class or Neoverse V2-class), is not offered by any cloud VM I could confirm, and its upstream KVM state in late 2026 was not verified; so plan on cheap EL2-capable boards plus rented Arm bare metal from early in the project.
+
+### Cited Findings
+- QEMU `virt`: `virtualization=on` emulates the Arm Virtualization Extensions (EL2); GIC version selectable up to 4 with virtualization on; `iommu=smmuv3` adds a machine-wide SMMUv3; these let the full A0–A9 path run in emulation. ITS-under-TCG support varies by QEMU version. — [QEMU virt docs](https://www.qemu.org/docs/master/system/arm/virt) (snippet)
+- Nested virtualization on Arm requires FEAT_NV2 hardware on a bare-metal host with recent kernel and QEMU; Arm's own learning path states it "isn't available inside a standard VM". — [Arm learning path: nested virtualization on an Arm server](https://learn.arm.com/learning-paths/servers-and-cloud-computing/nested-virtualization/) (snippet)
+- KVM/arm64 nested support history: groundwork merged in 6.3 (2023); restricted to FEAT_NV2 only (Nov 2023 series); NV_frac handling (Feb 2025); "Recursive NV" series v4 (May 2025). No 2026 status confirmation found. — [linux-arm-kernel Nov 2023](https://lists.infradead.org/pipermail/linux-arm-kernel/2023-November/882594.html); [Feb 2025](https://lists.infradead.org/pipermail/linux-arm-kernel/2025-February/1003138.html); [May 2025](https://lists.infradead.org/pipermail/linux-arm-kernel/2025-May/1028107.html) (snippets)
+- Ampere states AmpereOne supports nested virtualization via NV2 (vendor claim). — [Ampere blog "Unlocking layers"](https://amperecomputing.com/blogs/unlocking-layers) (snippet)
+- AWS: Graviton is explicitly not supported for the 2026 nested-virtualization feature; older re:Post answers say Graviton2 (Armv8.2) lacks NV. GCP lists Arm VMs as unsupported for nested virtualization. — [EC2 nested virtualization guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html); [AWS re:Post](https://www.repost.aws/questions/QUEoabj2ZERq2P5QFL6d6-RQ/nested-virtualization-on-graviton); [GCP overview](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview) (snippets)
+- GCP Axion and Graviton4 both use Neoverse V2 cores (Debian list post). — [debian-arm May 2025](https://lists.debian.org/debian-arm/2025/05/msg00018.html) (snippet)
+- Dev boards with proven EL2 hypervisor use: RK3588 (Orange Pi 5 Plus, EVM3588), RK3568 and Phytium Pi run AxVisor with Linux guests. — [AxVisor repo](https://github.com/arceos-hypervisor/axvisor)
+- Raspberry Pi 5: seL4 developers note seL4 needs EL2 to act as hypervisor there and that the Pi 5 CPU cannot run 32-bit code at EL1 or above. — [seL4 devel list, Oct 2025](https://go.mail-archive.com/devel@sel4.systems/msg04575.html) (snippet)
+- A realistic QEMU-based loop: 34 test suites in about 5 s, plus end-to-end tests against real TF-A firmware. — [users.rust-lang.org post](https://users.rust-lang.org/t/30k-lines-of-no-std-rust-a-bare-metal-arm64-hypervisor-that-replaces-googles-hafnium-spmc/139497)
+
+### Inferences
+- Tiered workflow:
+  1. Every commit: host unit tests + QEMU TCG `-M virt,virtualization=on,gic-version=3 -cpu max` (runs on any x86 CI runner, including GitHub-hosted; a Linux guest boot under double emulation takes tens of seconds to minutes). Add `iommu=smmuv3` and UEFI (EDK2 `QEMU_EFI.fd`, which can provide ACPI tables) variants to exercise the ACPI and SMMU paths.
+  2. Daily: boards on the desk with UART and network boot. RK3588 boards (8 cores, GICv3, up to 32 GB, about USD 100–200) are the best value and have big.LITTLE to shake out asymmetric-feature bugs; Raspberry Pi 4 is GICv2 (BCM2711 GIC-400), so it only helps if you carry a GICv2 path, which a server-focused design should not; Raspberry Pi 5 enters at EL2 and I believe has no GICv3 either (unverified). Boards are devicetree-only and have no SMMUv3/ITS comparable to servers.
+  3. Nightly/weekly: real servers. Ampere Altra/AmpereOne bare metal (Hetzner's Arm dedicated line, Oracle Cloud Ampere bare-metal shapes, Equinix-successor hosts) and AWS Graviton `.metal` instances; these are the only places to validate UEFI+ACPI, SMMUv3, ITS, RAS, and 64–192 core SMP. Provider availability not verified this session.
+- Nested acceleration (your hypervisor as an L1 guest of KVM on Arm) would speed the loop but requires owning or renting NV2-capable bare metal and a kernel with working NV; treat it as optional. Unlike x86, there is no Bochs-equivalent need: Arm has no entry-check failure class, and QEMU TCG with `-d int,guest_errors` plus gdbstub is adequate.
+- Arm FVP (Fixed Virtual Platform) models are the reference for newer architecture features (SME, GICv4.1, RME) when QEMU lags; free Base FVPs exist (unverified this session).
+- kvm-unit-tests has arm64 tests (gic, timer, psci, pmu) usable as guest payloads; not verified this session.
+
+### Gaps
+- Whether mainline KVM/arm64 nested virtualization is enabled and usable by default in late-2026 kernels: not confirmed.
+- Azure Cobalt and GCP Axion nested-virtualization status: nothing found. Graviton4 metal NV2 availability to customers: nothing found.
+- Raspberry Pi 5 interrupt controller type and EL2 handover details: not confirmed.
+- Current Arm bare-metal provider list and pricing: not researched.
+
+---
+
+## 15. One codebase for x86-64 and AArch64: arch abstraction and bring-up order
+
+### Takeaway
+Dual-arch hypervisors are normal (Xen, KVM, Bao, seL4, AxVisor all do it), and the evidence suggests about half or more of a small hypervisor plus essentially all of the VMM/control plane can be architecture-neutral if the seam is drawn at "vCPU run loop, stage-2 page tables, interrupt controller, platform discovery". My recommendation is to bring up AArch64 first on QEMU to shape the portable core, start x86 no later than the point the Arm guest boots Linux, and never let either architecture go more than a milestone ahead.
+
+### Cited Findings
+- AxVisor explicitly uses "the same codebase to support three architectures: x86_64, Arm (aarch64), and RISC-V" with functionality split into independent components behind standard interfaces; its source tree has a `src/hal/arch/` layer. — [AxVisor repo](https://github.com/arceos-hypervisor/axvisor); [docs.rs axvisor source tree](https://docs.rs/crate/axvisor/0.5.4/source/src/hal/arch/) (second is snippet)
+- Bao was designed clean-slate for both Armv8 and RISC-V and stays under about 20K SLOC. — [Bao paper](https://drops.dagstuhl.de/entities/document/10.4230/OASIcs.NG-RES.2020.3); [arXiv 2106.04514](https://arxiv.org/pdf/2106.04514.pdf) (snippets)
+- Cloud Hypervisor already abstracts hypervisor back ends (KVM, MSHV) and `vm-memory` lists x86_64, ARM64 and RISCV64 support, so the reusable Rust VMM layer is multi-arch today. — [Phoronix on CH 26](https://www.phoronix.com/news/Cloud-Hypervisor-26.0); [rust-vmm/vm-memory](https://github.com/rust-vmm/vm-memory)
+- Counter-examples where the second architecture lagged for years: Hedron/NOVA lineage is x86-only (Intel-only for Hedron); Edera lists aarch64 at 10–30%; seL4 libvmm's x86 support trails its Arm support; Oxide's Propolis is tested on AMD only. — [Hedron README](https://github.com/cyberus-technology/hedron); [krata repo](https://www.github.com/edera-dev/krata); [au-ts/libvmm](https://github.com/au-ts/libvmm); [oxidecomputer/propolis](https://github.com/oxidecomputer/propolis) (last three snippets)
+- Limine and `uefi-rs` cover both architectures, so one boot path (UEFI application) can serve both. — [limine crate 0.6.3](https://docs.rs/crate/limine/0.6.3); [uefi-rs](https://github.com/ben-krieger/uefi-rs) (snippets)
+
+### Inferences
+Suggested structure (my design recommendation):
+
+- `hv-core` (arch-neutral, `no_std`): physical frame allocator, heap, VM and vCPU objects and lifecycle state machines, scheduler, timers (deadline abstraction), guest-physical address-space manager (regions, CoW, sharing, ballooning policy), hypercall/control ABI, inter-VM shared memory and notification channels, virtio-mmio transport if any is in-hypervisor, logging/tracing, device-assignment policy. Target: no `cfg(target_arch)` inside it.
+- `hv-arch-{x86_64,aarch64}` implementing a small set of traits:
+  - `Vcpu`: create, load/save state, `run() -> Exit` with a **portable exit enum** (MMIO read/write with decoded address/size/data, hypercall, halt/WFI, shutdown/reset, plus an `ArchSpecific` variant), inject-interrupt, pending-work kick.
+  - `Stage2`: map/unmap/protect at 4K/2M/1G, dirty/access tracking, TLB invalidation by VM; EPT, NPT and Arm stage-2 all fit one interface (three formats, same algorithm; a generic page-table walker parameterised by entry format works).
+  - `HostCpu`: per-CPU init, idle, IPI, context for the hypervisor itself, feature detection, errata/mitigation hooks.
+  - `IrqChip` host side (x2APIC vs GICv3) and `VirtIrqChip` guest side (APICv/AVIC-assisted LAPIC vs vGICv3). **Do not try to unify the virtual interrupt controllers**; expose only "assert/deassert guest interrupt line N / send MSI" upward.
+  - `Iommu`: attach/detach device to VM address space, default-deny, MSI routing (VT-d/AMD-Vi vs SMMUv3+ITS).
+  - `Platform`: discovery producing one internal description (CPUs, memory, interrupt controllers, timers, PCI segments, IOMMU units, console) from ACPI on both architectures plus FDT on Arm; share the ACPI table walker, keep table-specific parsers (MADT LAPIC vs GIC entries, DMAR/IVRS vs IORT) per arch.
+  - `GuestBoot`: x86 `boot_params`/PVH vs Arm `Image` + generated FDT.
+- Shared outside ring 0/EL2: VMM/device models, control plane, API, image/snapshot tooling, test harness. Guest-visible platform should be made as similar as possible on both: virtio-only devices, PSCI-like/ACPI-reduced minimal platform, no legacy.
+- Things that will not abstract cleanly and need per-arch owners: world switch and exit handling; CPU feature/ID filtering (CPUID+MSRs vs ID registers); FP/vector state (XSAVE/AMX vs SVE/SME); speculation mitigations and errata; virtual interrupt controller; nested virt if ever needed; x86 instruction emulation for MMIO (Arm mostly avoids it through syndrome info).
+
+Which to bring up first:
+
+- **Arm first for the first guest, x86 immediately after** is my recommendation:
+  - Arm's EL2 model is the cleaner specification of what a hypervisor needs (explicit trap bits, syndrome-decoded MMIO, PSCI, hardware vGIC CPU interface), so an abstraction designed against Arm and then stretched to cover VMX and SVM tends to stay small; one designed around VMCS concepts tends to leak x86 notions (exit-qualification style details, instruction decode, APIC assumptions) into the portable core.
+  - The Rust crate support (Google's aarch64 crates) and small readable references (Bao, AxVisor, Rust-Shyper) are better on Arm; QEMU TCG gives full EL2 without nested-virt host requirements.
+  - x86 actually has three back ends (Intel VMX, AMD SVM, and their differing interrupt virtualisation), so it is where most of the arch-specific code and calendar time will go; it must not start late.
+- Arguments for x86 first, which may outweigh the above depending on the team: the commodity server fleet, bare-metal rental and cloud nested-virt CI are overwhelmingly x86; x86 development can use hardware-accelerated nested KVM today while Arm development is stuck on slow TCG or physical boards; and the commercially important I/O path (VT-d passthrough to a service VM) is easier to validate on x86.
+- Either way, the rule that matters is parallelism: put the second architecture's "boot, print, enter guest, exit" (M3/A4 level) in CI before the first architecture's virtio or IOMMU work begins, and gate every `hv-core` change on both builds. The counter-examples above show that a second architecture added later tends to stay at 10–30% for years.
+- Staffing implication: at least one engineer who owns each architecture; a 3-person team doing both is at the low end. Dual-arch adds, in my estimate, 40–60% to hypervisor-core effort (not 100%), concentrated in vCPU/irqchip/IOMMU/platform code, and little to the VMM/control-plane effort. This replaces the "30–50%" figure in section 8.
+
+### Gaps
+- No measured shared-vs-arch-specific LOC split for Xen, KVM, Bao or AxVisor was retrieved; the "about half" figure is my estimate.
+- No published experience report comparing Arm-first vs x86-first bring-up order was found.
+- AxVisor's actual trait/crate boundaries (axvcpu, axvm, x86_vcpu, arm_vcpu, axaddrspace, axdevice) were not confirmed from the repo page.
